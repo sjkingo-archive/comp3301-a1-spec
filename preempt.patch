@@ -1,0 +1,493 @@
+diff -r pth-2.0.7-dist/pth_lib.c pth-2.0.7-preempt/pth_lib.c
+130a131
+>     pth_sched_bootstrap(); /* bootstrap the preemptive scheduler */
+145a147
+> 
+diff -r pth-2.0.7-dist/pth_sched.c pth-2.0.7-preempt/pth_sched.c
+29a30,32
+> /* scheduling time slice in microseconds */
+> #define TIME_SLICE 100000
+> 
+49a53,246
+> static pth_time_t   snapshot;
+> static pth_time_t   running;
+> 
+> intern void pth_sched_housekeeping(void)
+> {
+>     int sig;
+>     struct sigaction sa;
+>     sigset_t ss;
+> 
+>     /*
+>      * Remove still pending thread-specific signals
+>      * (they are re-delivered next time)
+>      *
+>      * Situation is ('#' = signal pending):
+>      *     thread old pending (pth_current->sigpending): --##--##
+>      *     process old pending (pth_sigpending):         ----####
+>      *     process still pending (sigstillpending):      ---#-#-#
+>      * Result has to be:
+>      *     process new pending:                          -----#-#
+>      *     thread new pending (pth_current->sigpending): ---#---#
+>      */
+>     if (pth_current->sigpendcnt > 0) {
+>         sigset_t sigstillpending;
+>         sigpending(&sigstillpending);
+>         for (sig = 1; sig < PTH_NSIG; sig++) {
+>             if (sigismember(&pth_current->sigpending, sig)) {
+>                 if (!sigismember(&sigstillpending, sig)) {
+>                     /* thread (and perhaps also process) signal delivered */
+>                     sigdelset(&pth_current->sigpending, sig);
+>                     pth_current->sigpendcnt--;
+>                 }
+>                 else if (!sigismember(&pth_sigpending, sig)) {
+>                     /* thread signal not delivered */
+>                     pth_util_sigdelete(sig);
+>                 }
+>             }
+>         }
+>     }
+> 
+>     /*
+>      * Check for stack overflow
+>      */
+>     if (pth_current->stackguard != NULL) {
+>         if (*pth_current->stackguard != 0xDEAD) {
+>             pth_debug3("pth_sched_housekeeping: stack overflow detected for thread 0x%lx (\"%s\")",
+>                        (unsigned long)pth_current, pth_current->name);
+>             /*
+>              * if the application doesn't catch SIGSEGVs, we terminate
+>              * manually with a SIGSEGV now, but output a reasonable message.
+>              */
+>             if (sigaction(SIGSEGV, NULL, &sa) == 0) {
+>                 if (sa.sa_handler == SIG_DFL) {
+>                     fprintf(stderr, "**Pth** STACK OVERFLOW: thread pid_t=0x%lx, name=\"%s\"\n",
+>                             (unsigned long)pth_current, pth_current->name);
+>                     kill(getpid(), SIGSEGV);
+>                     sigfillset(&ss);
+>                     sigdelset(&ss, SIGSEGV);
+>                     sigsuspend(&ss);
+>                     abort();
+>                 }
+>             }
+>             /*
+>              * else we terminate the thread only and send us a SIGSEGV
+>              * which allows the application to handle the situation...
+>              */
+>             pth_current->join_arg = (void *)0xDEAD;
+>             pth_current->state = PTH_STATE_DEAD;
+>             kill(getpid(), SIGSEGV);
+>         }
+>     }
+> 
+>     /*
+>      * If previous thread is now marked as dead, kick it out
+>      */
+>     if (pth_current->state == PTH_STATE_DEAD) {
+>         pth_debug2("pth_sched_housekeeping: marking thread \"%s\" as dead", pth_current->name);
+>         if (!pth_current->joinable)
+>             pth_tcb_free(pth_current);
+>         else
+>             pth_pqueue_insert(&pth_DQ, PTH_PRIO_STD, pth_current);
+>         pth_current = NULL;
+>     }
+> 
+>     /*
+>      * If thread wants to wait for an event
+>      * move it to waiting queue now
+>      */
+>     if (pth_current != NULL && pth_current->state == PTH_STATE_WAITING) {
+>         pth_debug2("pth_sched_housekeeping: moving thread \"%s\" to waiting queue",
+>                    pth_current->name);
+>         pth_pqueue_insert(&pth_WQ, pth_current->prio, pth_current);
+>         pth_current = NULL;
+>     }
+> 
+>     /* insert last running thread back into the ready queue */
+>     if (pth_current != NULL)
+>         pth_pqueue_insert(&pth_RQ, pth_current->prio, pth_current);
+> 
+>     /*
+>      * Manage the events in the waiting queue, i.e. decide whether their
+>      * events occurred and move them to the ready queue. But wait only if
+>      * we have already no new or ready threads.
+>      */
+>     pth_debug1("pth_sched_housekeeping: performing wait queue management");
+>     if (   pth_pqueue_elements(&pth_RQ) == 0
+>         && pth_pqueue_elements(&pth_NQ) == 0)
+>         /* still no NEW or READY threads, so we have to wait for new work */
+>         pth_sched_eventmanager(&snapshot, FALSE /* wait */);
+>     else
+>         /* already NEW or READY threads exists, so just poll for even more work */
+>         pth_sched_eventmanager(&snapshot, TRUE  /* poll */);
+> 
+>     pth_debug1("pth_sched_housekeeping: finished work, returning to scheduler");
+> }
+> 
+> intern void pth_sched_preempt(int signum)
+> {
+>     /* update scheduler times */
+>     pth_time_set(&snapshot, PTH_TIME_NOW);
+> 
+>     /*
+>      * Calculate and update the time the previous thread was running
+>      */
+>     pth_time_set(&running, &snapshot);
+>     pth_time_sub(&running, &pth_current->lastran);
+>     pth_time_add(&pth_current->running, &running);
+>     pth_debug3("pth_sched_preempt: thread \"%s\" ran %.6f",
+>                pth_current->name, pth_time_t2d(&running));
+> 
+>     if (signum == SIGVTALRM) {
+>         pth_debug2("pth_sched_preempt: thread \"%s\" was preempted", pth_current->name);
+>     } else {
+>         pth_debug2("pth_sched_preempt: thread \"%s\" yielded control to scheduler", pth_current->name);
+>     }
+> 
+>     /* call housekeeping code while the scheduler has control */
+>     pth_sched_housekeeping();
+> 
+>     /* re-schedule */
+>     pth_debug1("pth_sched_preempt: re-scheduling");
+>     pth_scheduler(NULL);
+> }
+> 
+> intern void pth_sched_enable_preempt(void)
+> {
+>     sigset_t sigs;
+>     struct sigaction profsa;
+>     struct timeval preempt_tval;
+>     struct itimerval preempt_timer;
+> 
+>     /* block all signals in the scheduler thread, except SIGVTALRM since we use
+>      * this for preemption
+>      */
+>     sigfillset(&sigs);
+>     sigdelset(&sigs, SIGVTALRM);
+>     pth_sc(sigprocmask)(SIG_SETMASK, &sigs, NULL);
+> 
+>     /* trap SIGPROF for preemption */
+>     profsa.sa_handler = pth_sched_preempt;
+>     if (sigaction(SIGVTALRM, &profsa, NULL) < 0) {
+>         perror("** Unable to trap SIGVTALRM in Pth scheduler");
+>         abort();
+>     }
+> 
+>     /* set up the preemption timer */
+>     preempt_tval.tv_sec = 0;
+>     preempt_tval.tv_usec = TIME_SLICE;
+>     preempt_timer.it_interval = preempt_tval;
+>     preempt_timer.it_value = preempt_tval;
+>     if (setitimer(ITIMER_VIRTUAL, &preempt_timer, NULL) < 0) {
+>         perror("** Unable to set up preemption timer");
+>         abort();
+>     }
+>     pth_debug2("pth_sched_enable_preempt: scheduling slice set to %d ms", 
+>             TIME_SLICE / 1000);
+> }
+> 
+> 
+> /* bootstrap the preemptive scheduler */
+> intern void pth_sched_bootstrap(void)
+> {
+>     pth_debug1("pth_scheduler: bootstrapping");
+> 
+>     /* mark this thread as the special scheduler thread */
+>     pth_sched->state = PTH_STATE_SCHEDULER;
+> 
+>     /* enable preemption */
+>     pth_sched_enable_preempt();
+> 
+>     /* initialize the snapshot time for the first task */
+>     pth_time_set(&snapshot, PTH_TIME_NOW);
+>     pth_debug1("pth_scheduler: finished bootstrapping");
+> }
+> 
+158,163d354
+<     sigset_t sigs;
+<     pth_time_t running;
+<     pth_time_t snapshot;
+<     struct sigaction sa;
+<     sigset_t ss;
+<     int sig;
+164a356
+>     int sig;
+167c359,360
+<      * bootstrapping
+---
+>      * Move threads from new queue to ready queue and optionally
+>      * give them maximum priority so they start immediately.
+169,179c362,367
+<     pth_debug1("pth_scheduler: bootstrapping");
+< 
+<     /* mark this thread as the special scheduler thread */
+<     pth_sched->state = PTH_STATE_SCHEDULER;
+< 
+<     /* block all signals in the scheduler thread */
+<     sigfillset(&sigs);
+<     pth_sc(sigprocmask)(SIG_SETMASK, &sigs, NULL);
+< 
+<     /* initialize the snapshot time for bootstrapping the loop */
+<     pth_time_set(&snapshot, PTH_TIME_NOW);
+---
+>     while ((t = pth_pqueue_tail(&pth_NQ)) != NULL) {
+>         pth_pqueue_delete(&pth_NQ, t);
+>         t->state = PTH_STATE_READY;
+>         pth_pqueue_insert(&pth_RQ, PTH_PRIO_STD, t);
+>         pth_debug2("pth_scheduler: new thread \"%s\" moved to top of ready queue", t->name);
+>     }
+182c370
+<      * endless scheduler loop
+---
+>      * Update average scheduler load
+184,197c372
+<     for (;;) {
+<         /*
+<          * Move threads from new queue to ready queue and optionally
+<          * give them maximum priority so they start immediately.
+<          */
+<         while ((t = pth_pqueue_tail(&pth_NQ)) != NULL) {
+<             pth_pqueue_delete(&pth_NQ, t);
+<             t->state = PTH_STATE_READY;
+<             if (pth_favournew)
+<                 pth_pqueue_insert(&pth_RQ, pth_pqueue_favorite_prio(&pth_RQ), t);
+<             else
+<                 pth_pqueue_insert(&pth_RQ, PTH_PRIO_STD, t);
+<             pth_debug2("pth_scheduler: new thread \"%s\" moved to top of ready queue", t->name);
+<         }
+---
+>     pth_scheduler_load(&snapshot);
+199,295c374,384
+<         /*
+<          * Update average scheduler load
+<          */
+<         pth_scheduler_load(&snapshot);
+< 
+<         /*
+<          * Find next thread in ready queue
+<          */
+<         pth_current = pth_pqueue_delmax(&pth_RQ);
+<         if (pth_current == NULL) {
+<             fprintf(stderr, "**Pth** SCHEDULER INTERNAL ERROR: "
+<                             "no more thread(s) available to schedule!?!?\n");
+<             abort();
+<         }
+<         pth_debug4("pth_scheduler: thread \"%s\" selected (prio=%d, qprio=%d)",
+<                    pth_current->name, pth_current->prio, pth_current->q_prio);
+< 
+<         /*
+<          * Raise additionally thread-specific signals
+<          * (they are delivered when we switch the context)
+<          *
+<          * Situation is ('#' = signal pending):
+<          *     process pending (pth_sigpending):         ----####
+<          *     thread pending (pth_current->sigpending): --##--##
+<          * Result has to be:
+<          *     process new pending:                      --######
+<          */
+<         if (pth_current->sigpendcnt > 0) {
+<             sigpending(&pth_sigpending);
+<             for (sig = 1; sig < PTH_NSIG; sig++)
+<                 if (sigismember(&pth_current->sigpending, sig))
+<                     if (!sigismember(&pth_sigpending, sig))
+<                         kill(getpid(), sig);
+<         }
+< 
+<         /*
+<          * Set running start time for new thread
+<          * and perform a context switch to it
+<          */
+<         pth_debug3("pth_scheduler: switching to thread 0x%lx (\"%s\")",
+<                    (unsigned long)pth_current, pth_current->name);
+< 
+<         /* update thread times */
+<         pth_time_set(&pth_current->lastran, PTH_TIME_NOW);
+< 
+<         /* update scheduler times */
+<         pth_time_set(&running, &pth_current->lastran);
+<         pth_time_sub(&running, &snapshot);
+<         pth_time_add(&pth_sched->running, &running);
+< 
+<         /* ** ENTERING THREAD ** - by switching the machine context */
+<         pth_current->dispatches++;
+<         pth_mctx_switch(&pth_sched->mctx, &pth_current->mctx);
+< 
+<         /* update scheduler times */
+<         pth_time_set(&snapshot, PTH_TIME_NOW);
+<         pth_debug3("pth_scheduler: cameback from thread 0x%lx (\"%s\")",
+<                    (unsigned long)pth_current, pth_current->name);
+< 
+<         /*
+<          * Calculate and update the time the previous thread was running
+<          */
+<         pth_time_set(&running, &snapshot);
+<         pth_time_sub(&running, &pth_current->lastran);
+<         pth_time_add(&pth_current->running, &running);
+<         pth_debug3("pth_scheduler: thread \"%s\" ran %.6f",
+<                    pth_current->name, pth_time_t2d(&running));
+< 
+<         /*
+<          * Remove still pending thread-specific signals
+<          * (they are re-delivered next time)
+<          *
+<          * Situation is ('#' = signal pending):
+<          *     thread old pending (pth_current->sigpending): --##--##
+<          *     process old pending (pth_sigpending):         ----####
+<          *     process still pending (sigstillpending):      ---#-#-#
+<          * Result has to be:
+<          *     process new pending:                          -----#-#
+<          *     thread new pending (pth_current->sigpending): ---#---#
+<          */
+<         if (pth_current->sigpendcnt > 0) {
+<             sigset_t sigstillpending;
+<             sigpending(&sigstillpending);
+<             for (sig = 1; sig < PTH_NSIG; sig++) {
+<                 if (sigismember(&pth_current->sigpending, sig)) {
+<                     if (!sigismember(&sigstillpending, sig)) {
+<                         /* thread (and perhaps also process) signal delivered */
+<                         sigdelset(&pth_current->sigpending, sig);
+<                         pth_current->sigpendcnt--;
+<                     }
+<                     else if (!sigismember(&pth_sigpending, sig)) {
+<                         /* thread signal not delivered */
+<                         pth_util_sigdelete(sig);
+<                     }
+<                 }
+<             }
+<         }
+---
+>     /* pick the next task from the head of the ready queue. this implements a
+>      * round robin method */
+>     pth_current = pth_RQ.q_head;
+>     if (pth_current == NULL) {
+>         fprintf(stderr, "**Pth** SCHEDULER INTERNAL ERROR: "
+>                         "no more thread(s) available to schedule!?!?\n");
+>         abort();
+>     }
+>     pth_debug4("pth_scheduler: thread \"%s\" selected (prio=%d, qprio=%d)",
+>                pth_current->name, pth_current->prio, pth_current->q_prio);
+>     pth_pqueue_delete(&pth_RQ, pth_current);
+297,327c386,402
+<         /*
+<          * Check for stack overflow
+<          */
+<         if (pth_current->stackguard != NULL) {
+<             if (*pth_current->stackguard != 0xDEAD) {
+<                 pth_debug3("pth_scheduler: stack overflow detected for thread 0x%lx (\"%s\")",
+<                            (unsigned long)pth_current, pth_current->name);
+<                 /*
+<                  * if the application doesn't catch SIGSEGVs, we terminate
+<                  * manually with a SIGSEGV now, but output a reasonable message.
+<                  */
+<                 if (sigaction(SIGSEGV, NULL, &sa) == 0) {
+<                     if (sa.sa_handler == SIG_DFL) {
+<                         fprintf(stderr, "**Pth** STACK OVERFLOW: thread pid_t=0x%lx, name=\"%s\"\n",
+<                                 (unsigned long)pth_current, pth_current->name);
+<                         kill(getpid(), SIGSEGV);
+<                         sigfillset(&ss);
+<                         sigdelset(&ss, SIGSEGV);
+<                         sigsuspend(&ss);
+<                         abort();
+<                     }
+<                 }
+<                 /*
+<                  * else we terminate the thread only and send us a SIGSEGV
+<                  * which allows the application to handle the situation...
+<                  */
+<                 pth_current->join_arg = (void *)0xDEAD;
+<                 pth_current->state = PTH_STATE_DEAD;
+<                 kill(getpid(), SIGSEGV);
+<             }
+<         }
+---
+>     /*
+>      * Raise additionally thread-specific signals
+>      * (they are delivered when we switch the context)
+>      *
+>      * Situation is ('#' = signal pending):
+>      *     process pending (pth_sigpending):         ----####
+>      *     thread pending (pth_current->sigpending): --##--##
+>      * Result has to be:
+>      *     process new pending:                      --######
+>      */
+>     if (pth_current->sigpendcnt > 0) {
+>         sigpending(&pth_sigpending);
+>         for (sig = 1; sig < PTH_NSIG; sig++)
+>             if (sigismember(&pth_current->sigpending, sig))
+>                 if (!sigismember(&pth_sigpending, sig))
+>                     kill(getpid(), sig);
+>     }
+329,339c404,405
+<         /*
+<          * If previous thread is now marked as dead, kick it out
+<          */
+<         if (pth_current->state == PTH_STATE_DEAD) {
+<             pth_debug2("pth_scheduler: marking thread \"%s\" as dead", pth_current->name);
+<             if (!pth_current->joinable)
+<                 pth_tcb_free(pth_current);
+<             else
+<                 pth_pqueue_insert(&pth_DQ, PTH_PRIO_STD, pth_current);
+<             pth_current = NULL;
+<         }
+---
+>     pth_debug3("pth_scheduler: switching to thread 0x%lx (\"%s\")",
+>                (unsigned long)pth_current, pth_current->name);
+341,350c407,408
+<         /*
+<          * If thread wants to wait for an event
+<          * move it to waiting queue now
+<          */
+<         if (pth_current != NULL && pth_current->state == PTH_STATE_WAITING) {
+<             pth_debug2("pth_scheduler: moving thread \"%s\" to waiting queue",
+<                        pth_current->name);
+<             pth_pqueue_insert(&pth_WQ, pth_current->prio, pth_current);
+<             pth_current = NULL;
+<         }
+---
+>     /* update thread times */
+>     pth_time_set(&pth_current->lastran, PTH_TIME_NOW);
+352,373c410,423
+<         /*
+<          * migrate old treads in ready queue into higher
+<          * priorities to avoid starvation and insert last running
+<          * thread back into this queue, too.
+<          */
+<         pth_pqueue_increase(&pth_RQ);
+<         if (pth_current != NULL)
+<             pth_pqueue_insert(&pth_RQ, pth_current->prio, pth_current);
+< 
+<         /*
+<          * Manage the events in the waiting queue, i.e. decide whether their
+<          * events occurred and move them to the ready queue. But wait only if
+<          * we have already no new or ready threads.
+<          */
+<         if (   pth_pqueue_elements(&pth_RQ) == 0
+<             && pth_pqueue_elements(&pth_NQ) == 0)
+<             /* still no NEW or READY threads, so we have to wait for new work */
+<             pth_sched_eventmanager(&snapshot, FALSE /* wait */);
+<         else
+<             /* already NEW or READY threads exists, so just poll for even more work */
+<             pth_sched_eventmanager(&snapshot, TRUE  /* poll */);
+<     }
+---
+>     /* update scheduler times */
+>     pth_time_set(&running, &pth_current->lastran);
+>     pth_time_sub(&running, &snapshot);
+>     pth_time_add(&pth_sched->running, &running);
+> 
+>     /* ** ENTERING THREAD ** - by switching the machine context */
+>     pth_current->dispatches++;
+>     pth_mctx_switch(&pth_sched->mctx, &pth_current->mctx);
+> 
+>     /* we cannot guarantee any code below here is executed as the thread may
+>      * never yield and instead be preempted, so call the same code path. We need
+>      * to do this as quickly as possible so time accounting doesn't include any
+>      * scheduler time */
+>     pth_sched_preempt(0);
+375c425,426
+<     /* NOTREACHED */
+---
+>     /* never get here */
+>     pth_debug1("pth_scheduler: fell off end of scheduler");
+378d428
+< 
