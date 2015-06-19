@@ -1,0 +1,23 @@
+Each file in this directory is a test input that the a1test program can parse.
+The files specify the test case that should be run. The format is as follows:
+
+[BEGIN FILE]
+lifetime
+prio_i greedy_i
+prio_i+1 greedy_i+1
+...
+prio_i+N greedy_i+N
+[END FILE]
+
+All inputs should be integers and are parsed as such. The first line of the
+file contains one field (with no trailing or leading whitespace) that denotes
+the lifetime of the process (in seconds) -- that is, how long the test program
+will run for.
+
+Every other line contains details of a thread to spawn. There must be at least
+one (so a valid file will always 2 or more lines). These lines contain two
+fields (separated by a single space): the first is the priority of the thread
+(this will be set via the library call pth_attr_set(PTR_ATTR_PRIO, ...). The
+second field is the "greedy factor". This is an integer in the range [0..100],
+denoting how "greedy" the thread will be, that is, how long it will spend on
+the CPU before yielding.
